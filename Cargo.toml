@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/h-i-v-e/jwt_hmac"
 homepage = "https://github.com/h-i-v-e/jwt_hmac"
 readme = "README.md"
+description = "A simple library for generating and parsing JWT tokens using HMAC SHA256 as per https://jwt.io/introduction"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

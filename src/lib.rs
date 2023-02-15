@@ -2,23 +2,29 @@ use serde::{Serialize, Deserialize};
 use base64_url;
 use serde_json;
 use hmac;
-use hmac::{NewMac, Mac, Hmac};
-use hmac::crypto_mac::{Output, InvalidKeyLength};
+use hmac::{Mac, HmacCore};
 use sha2::Sha256;
 use std::fmt::{Display, Formatter};
 use std::result;
+use std::str::{from_utf8, Utf8Error};
 use base64_url::base64::DecodeError;
+use hmac::digest::{CtOutput, InvalidLength};
+use hmac::digest::core_api::CoreWrapper;
 
 static HEADER: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9";
+static HEADER_LENGTH: usize = HEADER.len();
+static SIGNATURE_LENGTH: usize = 43;
+static MIN_TOKEN_LENGTH: usize = HEADER_LENGTH + SIGNATURE_LENGTH + 3;
 
 #[derive(Debug)]
 pub enum Error{
     JsonError(serde_json::error::Error),
-    InvalidKeyLength(InvalidKeyLength),
+    InvalidKeyLength(InvalidLength),
     Base64UrlDecodeError(DecodeError),
+    Utf8Error(Utf8Error),
     InvalidHeader,
     InvalidChecksum,
-    MissingPart
+    TooShort
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -29,37 +35,53 @@ impl Display for Error {
             Self::JsonError(error) => error.fmt(f),
             Self::Base64UrlDecodeError(error) => error.fmt(f),
             Self::InvalidKeyLength(error) => error.fmt(f),
+            Self::Utf8Error(error) => error.fmt(f),
             Self::InvalidHeader => f.write_str("unsupported header values"),
             Self::InvalidChecksum => f.write_str("checksum does not match"),
-            Self::MissingPart => f.write_str(
-                "expected 3 base 64 url encoded parts seperated by dots"
-            )
+            Self::TooShort => f.write_str("token is too short")
         }
     }
 }
 
 impl std::error::Error for Error{}
 
-fn decode_part(part: Option<&str>) -> Result<Vec<u8>> {
-    match part {
-        Some(base64) => match base64_url::decode(base64){
-            Ok(result) => Ok(result),
-            Err(err) => {
-                Err(Error::Base64UrlDecodeError(err))
-            }
-        },
-        None => Err(Error::MissingPart)
+impl From<Utf8Error> for Error{
+    fn from(value: Utf8Error) -> Self {
+        Self::Utf8Error(value)
     }
 }
 
-fn calc_checksum(secret: &[u8], value: &[u8]) -> Result<Output<Hmac<Sha256>>>{
-    match hmac::Hmac::<Sha256>::new_from_slice(secret){
-        Ok(mut hasher) => {
-            hasher.update(value);
-            Ok(hasher.finalize())
-        },
-        Err(error) => Err(Error::InvalidKeyLength(error))
+impl From<DecodeError> for Error{
+    fn from(value: DecodeError) -> Self {
+        Self::Base64UrlDecodeError(value)
     }
+}
+
+impl From<serde_json::error::Error> for Error{
+    fn from(value: serde_json::Error) -> Self {
+        Self::JsonError(value)
+    }
+}
+
+impl From<InvalidLength> for Error{
+    fn from(value: InvalidLength) -> Self {
+        Self::InvalidKeyLength(value)
+    }
+}
+
+fn calc_checksum(secret: &[u8], value: &[u8]) -> Result<CtOutput<CoreWrapper<HmacCore<Sha256>>>>{
+    let mut hasher = hmac::Hmac::<Sha256>::new_from_slice(secret)?;
+    hasher.update(value);
+    Ok(hasher.finalize())
+}
+
+fn body_with_header<T>(claims: &T) -> Result<String> where T: Serialize {
+    let serialized = base64_url::encode(serde_json::to_string(&claims)?.as_bytes());
+    let mut output = String::with_capacity(serialized.len() + MIN_TOKEN_LENGTH);
+    output.push_str(HEADER);
+    output.push('.');
+    output.push_str(serialized.as_str());
+    Ok(output)
 }
 
 /// Deserialize the claims struct from a jwt token
@@ -79,7 +101,7 @@ fn calc_checksum(secret: &[u8], value: &[u8]) -> Result<Output<Hmac<Sha256>>>{
 ///     let secret = "I'm a secret".as_bytes();
 ///     match jwt_hmac::parse::<Claims>(
 ///         secret,
-///         "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWV9.azXPRJHeWcZ_B5WHtA98gsnowX5gifvMJX2hoH_4YPs"
+///         "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWV9.6ekn8MWtOmVT6FMqbAlVQQmretopbWpef_lHV9dYMf4"
 ///     ){
 ///         Ok(claims) => println!("Sub: {}", claims.sub),
 ///         Err(error) => match error{
@@ -90,26 +112,23 @@ fn calc_checksum(secret: &[u8], value: &[u8]) -> Result<Output<Hmac<Sha256>>>{
 ///  }
 /// ```
 pub fn parse<T>(secret: &[u8], token: &str) -> Result<T> where T: for<'a> Deserialize<'a> {
-    let mut parts = token.split('.');
-    match parts.next(){
-        Some(header) => {
-            if header != HEADER{
-                return Err(Error::InvalidHeader)
-            }
-        },
-        None => return Err(Error::InvalidHeader)
+    let len = token.len();
+    if len < MIN_TOKEN_LENGTH{
+        return Err(Error::TooShort);
     }
-    let claims = decode_part(parts.next())?;
-    let hash = decode_part(parts.next())?;
-    if calc_checksum(secret, claims.as_slice())?.into_bytes().as_slice() != hash.as_slice() {
+    let bytes = token.as_bytes();
+    if &bytes[..HEADER_LENGTH] != HEADER.as_bytes() {
+        return Err(Error::InvalidHeader)
+    }
+    let sig_offset = len - SIGNATURE_LENGTH;
+    let checksum = calc_checksum(secret, &bytes[..sig_offset - 1])?;
+    let signature = base64_url::decode(from_utf8(&bytes[sig_offset..])?)?;
+    if checksum.into_bytes().as_slice() != signature.as_slice(){
         return Err(Error::InvalidChecksum);
     }
-    match serde_json::from_slice::<T>(claims.as_slice()){
-        Ok(claims) => Ok(claims),
-        Err(error) => {
-            Err(Error::JsonError(error))
-        }
-    }
+    Ok(serde_json::from_slice::<T>(
+        base64_url::decode(&bytes[HEADER_LENGTH + 1 .. sig_offset - 1])?.as_slice()
+    )?)
 }
 
 /// Generate a JWT token with the provided claims using the given secret
@@ -141,17 +160,13 @@ pub fn parse<T>(secret: &[u8], token: &str) -> Result<T> where T: for<'a> Deseri
 ///  }
 /// ```
 pub fn create<T>(secret: &[u8], claims: &T) -> Result<String> where T: Serialize {
-    match serde_json::to_string(claims){
-        Ok(json) => Ok(format!(
-            "{}.{}.{}",
-            HEADER,
-            base64_url::encode(json.as_bytes()),
-            base64_url::encode(
-                calc_checksum(secret, json.as_bytes())?.into_bytes().as_slice()
-            )
-        )),
-        Err(error) => Err(Error::JsonError(error))
-    }
+    let mut main = body_with_header(claims)?;
+    let hash = base64_url::encode(
+        calc_checksum(secret, main.as_bytes())?.into_bytes().as_slice()
+    );
+    main.push('.');
+    main.push_str(hash.as_str());
+    Ok(main)
 }
 
 #[cfg(test)]
@@ -159,7 +174,7 @@ mod tests {
     use crate::{create, parse, Error};
     use serde::{Deserialize, Serialize};
 
-    static SERIALIZED: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWV9.azXPRJHeWcZ_B5WHtA98gsnowX5gifvMJX2hoH_4YPs";
+    static SERIALIZED: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWV9.6ekn8MWtOmVT6FMqbAlVQQmretopbWpef_lHV9dYMf4";
     static BAD_CHECKSUM: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWV9.azXPRJHeWcZ_B5aHtA98gsnowX5gifvMJX2hoH_4YPs";
     static NAME: &str = "John Doe";
     static SECRET: &str = "I'm a secret";
@@ -184,7 +199,9 @@ mod tests {
             admin: true
         };
         match create(SECRET.as_bytes(), &test){
-            Ok(token) => assert_eq!(token.as_str(), SERIALIZED),
+            Ok(token) => {
+                assert_eq!(token.as_str(), SERIALIZED)
+            },
             Err(error) => panic!("{}", error)
         }
     }

@@ -123,7 +123,7 @@ pub fn parse<T>(secret: &[u8], token: &str) -> Result<T> where T: for<'a> Deseri
     let sig_offset = len - SIGNATURE_LENGTH;
     let checksum = calc_checksum(secret, &bytes[..sig_offset - 1])?;
     let signature = base64_url::decode(from_utf8(&bytes[sig_offset..])?)?;
-    if checksum.into_bytes().as_slice() != signature.as_slice(){
+    if &*checksum.into_bytes() != signature.as_slice(){
         return Err(Error::InvalidChecksum);
     }
     Ok(serde_json::from_slice::<T>(
@@ -162,7 +162,7 @@ pub fn parse<T>(secret: &[u8], token: &str) -> Result<T> where T: for<'a> Deseri
 pub fn create<T>(secret: &[u8], claims: &T) -> Result<String> where T: Serialize {
     let mut main = body_with_header(claims)?;
     let hash = base64_url::encode(
-        calc_checksum(secret, main.as_bytes())?.into_bytes().as_slice()
+        &*calc_checksum(secret, main.as_bytes())?.into_bytes()
     );
     main.push('.');
     main.push_str(hash.as_str());

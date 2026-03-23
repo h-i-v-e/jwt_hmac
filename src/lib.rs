@@ -84,6 +84,35 @@ fn body_with_header<T>(claims: &T) -> Result<String> where T: Serialize {
     Ok(output)
 }
 
+/// Validate a JWT token and return the decoded payload bytes.
+///
+/// The token must use the crate's fixed `{"typ":"JWT","alg":"HS256"}` header
+/// and contain an HMAC-SHA256 signature generated from `secret`.
+///
+/// # Errors
+///
+/// Returns [`Error::TooShort`] if the token is shorter than the minimum JWT
+/// shape expected by this crate, [`Error::InvalidHeader`] if the encoded header
+/// does not match, [`Error::InvalidChecksum`] if the signature does not verify,
+/// or a decoding error if the payload or signature is not valid base64url/UTF-8.
+pub fn extract_validated_body<'a>(secret: &[u8], token: &'a str) -> Result<Vec<u8>>{
+    let len = token.len();
+    if len < MIN_TOKEN_LENGTH{
+        return Err(Error::TooShort);
+    }
+    let bytes = token.as_bytes();
+    if &bytes[..HEADER_LENGTH] != HEADER.as_bytes() {
+        return Err(Error::InvalidHeader)
+    }
+    let sig_offset = len - SIGNATURE_LENGTH;
+    let checksum = calc_checksum(secret, &bytes[..sig_offset - 1])?;
+    let signature = base64_url::decode(from_utf8(&bytes[sig_offset..])?)?;
+    if &*checksum.into_bytes() != signature.as_slice(){
+        return Err(Error::InvalidChecksum);
+    }
+    Ok(base64_url::decode(&bytes[HEADER_LENGTH + 1 .. sig_offset - 1])?)
+}
+
 /// Deserialize the claims struct from a jwt token
 ///
 /// #Example
@@ -112,22 +141,8 @@ fn body_with_header<T>(claims: &T) -> Result<String> where T: Serialize {
 ///  }
 /// ```
 pub fn parse<T>(secret: &[u8], token: &str) -> Result<T> where T: for<'a> Deserialize<'a> {
-    let len = token.len();
-    if len < MIN_TOKEN_LENGTH{
-        return Err(Error::TooShort);
-    }
-    let bytes = token.as_bytes();
-    if &bytes[..HEADER_LENGTH] != HEADER.as_bytes() {
-        return Err(Error::InvalidHeader)
-    }
-    let sig_offset = len - SIGNATURE_LENGTH;
-    let checksum = calc_checksum(secret, &bytes[..sig_offset - 1])?;
-    let signature = base64_url::decode(from_utf8(&bytes[sig_offset..])?)?;
-    if &*checksum.into_bytes() != signature.as_slice(){
-        return Err(Error::InvalidChecksum);
-    }
     Ok(serde_json::from_slice::<T>(
-        base64_url::decode(&bytes[HEADER_LENGTH + 1 .. sig_offset - 1])?.as_slice()
+        extract_validated_body(secret, token)?.as_slice()
     )?)
 }
 

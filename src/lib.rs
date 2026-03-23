@@ -1,11 +1,11 @@
+use serde::de::DeserializeOwned;
 use serde::{Serialize, Deserialize};
 use base64_url;
 use serde_json;
 use hmac;
 use hmac::{Mac, HmacCore};
 use sha2::Sha256;
-use std::fmt::{Display, Formatter};
-use std::result;
+use thiserror::Error;
 use std::str::{from_utf8, Utf8Error};
 use base64_url::base64::DecodeError;
 use hmac::digest::{CtOutput, InvalidLength};
@@ -16,39 +16,22 @@ static HEADER_LENGTH: usize = HEADER.len();
 static SIGNATURE_LENGTH: usize = 43;
 static MIN_TOKEN_LENGTH: usize = HEADER_LENGTH + SIGNATURE_LENGTH + 3;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum Error{
-    JsonError(serde_json::error::Error),
-    InvalidKeyLength(InvalidLength),
+    #[error(transparent)]
+    JsonError(#[from] serde_json::error::Error),
+    #[error(transparent)]
+    InvalidKeyLength(#[from] InvalidLength),
+    #[error("{0}")]
     Base64UrlDecodeError(DecodeError),
-    Utf8Error(Utf8Error),
+    #[error(transparent)]
+    Utf8Error(#[from] Utf8Error),
+    #[error("unsupported header values")]
     InvalidHeader,
-    InvalidChecksum,
+    #[error("signature does not match")]
+    SignatureDoesNotMatch,
+    #[error("too short to be a valid JWT")]
     TooShort
-}
-
-pub type Result<T> = result::Result<T, Error>;
-
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match &*self{
-            Self::JsonError(error) => error.fmt(f),
-            Self::Base64UrlDecodeError(error) => error.fmt(f),
-            Self::InvalidKeyLength(error) => error.fmt(f),
-            Self::Utf8Error(error) => error.fmt(f),
-            Self::InvalidHeader => f.write_str("unsupported header values"),
-            Self::InvalidChecksum => f.write_str("checksum does not match"),
-            Self::TooShort => f.write_str("token is too short")
-        }
-    }
-}
-
-impl std::error::Error for Error{}
-
-impl From<Utf8Error> for Error{
-    fn from(value: Utf8Error) -> Self {
-        Self::Utf8Error(value)
-    }
 }
 
 impl From<DecodeError> for Error{
@@ -57,19 +40,9 @@ impl From<DecodeError> for Error{
     }
 }
 
-impl From<serde_json::error::Error> for Error{
-    fn from(value: serde_json::Error) -> Self {
-        Self::JsonError(value)
-    }
-}
+pub type Result<T> = std::result::Result<T, Error>;
 
-impl From<InvalidLength> for Error{
-    fn from(value: InvalidLength) -> Self {
-        Self::InvalidKeyLength(value)
-    }
-}
-
-fn calc_checksum(secret: &[u8], value: &[u8]) -> Result<CtOutput<CoreWrapper<HmacCore<Sha256>>>>{
+fn calc_signature(secret: &[u8], value: &[u8]) -> Result<CtOutput<CoreWrapper<HmacCore<Sha256>>>>{
     let mut hasher = hmac::Hmac::<Sha256>::new_from_slice(secret)?;
     hasher.update(value);
     Ok(hasher.finalize())
@@ -84,33 +57,65 @@ fn body_with_header<T>(claims: &T) -> Result<String> where T: Serialize {
     Ok(output)
 }
 
-/// Validate a JWT token and return the decoded payload bytes.
+/// A decoded JWT split into the pieces needed for payload extraction and
+/// signature verification.
 ///
-/// The token must use the crate's fixed `{"typ":"JWT","alg":"HS256"}` header
-/// and contain an HMAC-SHA256 signature generated from `secret`.
-///
-/// # Errors
-///
-/// Returns [`Error::TooShort`] if the token is shorter than the minimum JWT
-/// shape expected by this crate, [`Error::InvalidHeader`] if the encoded header
-/// does not match, [`Error::InvalidChecksum`] if the signature does not verify,
-/// or a decoding error if the payload or signature is not valid base64url/UTF-8.
-pub fn extract_validated_body<'a>(secret: &[u8], token: &'a str) -> Result<Vec<u8>>{
-    let len = token.len();
-    if len < MIN_TOKEN_LENGTH{
-        return Err(Error::TooShort);
+/// This type parses tokens produced by this crate's fixed HS256 header format.
+/// Use [`TryFrom<&str>`] to decode the token, [`DecodedJwtHmac::check_signature`]
+/// to verify it against a secret, and
+/// [`DecodedJwtHmac::try_extract_claims`] to deserialize the payload.
+pub struct DecodedJwtHmac<'a>{
+    /// The original `header.payload` bytes used as the HMAC input.
+    pub encoded_header_and_body: &'a [u8],
+    /// The decoded JWT payload bytes.
+    pub decoded_body: Vec<u8>,
+    /// The decoded JWT signature bytes.
+    pub decoded_signature: Vec<u8>
+}
+
+impl<'a> TryFrom<&'a str> for DecodedJwtHmac<'a>{
+    type Error = Error;
+
+    fn try_from(token: &'a str) -> std::result::Result<Self, Self::Error> {
+        let len = token.len();
+        if len < MIN_TOKEN_LENGTH{
+            return Err(Error::TooShort);
+        }
+        let bytes = token.as_bytes();
+        if &bytes[..HEADER_LENGTH] != HEADER.as_bytes() {
+            return Err(Error::InvalidHeader)
+        }
+        let sig_offset = len - SIGNATURE_LENGTH;
+        Ok(Self{
+            encoded_header_and_body: &bytes[..sig_offset - 1],
+            decoded_body: base64_url::decode(&bytes[HEADER_LENGTH + 1 .. sig_offset - 1])?,
+            decoded_signature: base64_url::decode(from_utf8(&bytes[sig_offset..])?)?
+        })
     }
-    let bytes = token.as_bytes();
-    if &bytes[..HEADER_LENGTH] != HEADER.as_bytes() {
-        return Err(Error::InvalidHeader)
+}
+
+impl DecodedJwtHmac<'_>{
+    /// Deserialize the decoded payload into a claims type.
+    pub fn try_extract_claims<T: DeserializeOwned>(&self) -> Result<T>{
+        Ok(serde_json::from_slice(&self.decoded_body.as_slice())?)
     }
-    let sig_offset = len - SIGNATURE_LENGTH;
-    let checksum = calc_checksum(secret, &bytes[..sig_offset - 1])?;
-    let signature = base64_url::decode(from_utf8(&bytes[sig_offset..])?)?;
-    if &*checksum.into_bytes() != signature.as_slice(){
-        return Err(Error::InvalidChecksum);
+
+    /// Verify that the decoded signature matches `secret`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SignatureDoesNotMatch`] when the signature is validly
+    /// decoded but does not match the HMAC-SHA256 signature computed from
+    /// `secret`.
+    pub fn check_signature(&self, secret: &[u8]) -> Result<()>{
+         let signature = calc_signature(secret, self.encoded_header_and_body)?;
+         if &*signature.into_bytes() == self.decoded_signature.as_slice(){
+            Ok(())
+         }
+         else {
+            Err(Error::SignatureDoesNotMatch)
+         }
     }
-    Ok(base64_url::decode(&bytes[HEADER_LENGTH + 1 .. sig_offset - 1])?)
 }
 
 /// Deserialize the claims struct from a jwt token
@@ -118,7 +123,6 @@ pub fn extract_validated_body<'a>(secret: &[u8], token: &'a str) -> Result<Vec<u
 /// #Example
 ///
 /// ```
-/// use jwt_hmac;
 /// use serde::Deserialize;
 ///
 /// #[derive(Deserialize)]
@@ -134,16 +138,16 @@ pub fn extract_validated_body<'a>(secret: &[u8], token: &'a str) -> Result<Vec<u
 ///     ){
 ///         Ok(claims) => println!("Sub: {}", claims.sub),
 ///         Err(error) => match error{
-///             jwt_hmac::Error::InvalidChecksum => println!("Secret doesn't match"),
+///             jwt_hmac::Error::SignatureDoesNotMatch => println!("Secret doesn't match"),
 ///             _ => println!("Probably not a valid JWT: {}", error)
 ///         }
 ///     }
 ///  }
 /// ```
 pub fn parse<T>(secret: &[u8], token: &str) -> Result<T> where T: for<'a> Deserialize<'a> {
-    Ok(serde_json::from_slice::<T>(
-        extract_validated_body(secret, token)?.as_slice()
-    )?)
+    let hmac = DecodedJwtHmac::try_from(token)?;
+    hmac.check_signature(secret)?;
+    hmac.try_extract_claims()
 }
 
 /// Generate a JWT token with the provided claims using the given secret
@@ -151,7 +155,6 @@ pub fn parse<T>(secret: &[u8], token: &str) -> Result<T> where T: for<'a> Deseri
 /// #Example
 ///
 /// ```
-/// use jwt_hmac;
 /// use serde::Serialize;
 ///
 /// #[derive(Serialize)]
@@ -177,7 +180,7 @@ pub fn parse<T>(secret: &[u8], token: &str) -> Result<T> where T: for<'a> Deseri
 pub fn create<T>(secret: &[u8], claims: &T) -> Result<String> where T: Serialize {
     let mut main = body_with_header(claims)?;
     let hash = base64_url::encode(
-        &*calc_checksum(secret, main.as_bytes())?.into_bytes()
+        &*calc_signature(secret, main.as_bytes())?.into_bytes()
     );
     main.push('.');
     main.push_str(hash.as_str());
@@ -234,7 +237,7 @@ mod tests {
         match parse::<InClaims>(SECRET.as_bytes(), BAD_CHECKSUM){
             Ok(_) => assert!(false, "Should not recognize checksum"),
             Err(error) => match error {
-                Error::InvalidChecksum => return,
+                Error::SignatureDoesNotMatch => return,
                 _ => assert!(false, "Should have produced Error::InvalidChecksum")
             }
         }
